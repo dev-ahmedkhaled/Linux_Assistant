@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+.venv/
+testenv/
+*.egg-info/
+
+# Distribution / packaging
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & history
+*.log
+.linux_assistant_history.json
+
+# Datasets (too large for git)
+Datasets/
+data/
+*.jsonl
+*.json
+!requirements.txt
+
+# Model files
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+checkpoints/
+*_output/
+*_lora/
+*_gguf/
+
+# ChromaDB vector store
+chroma_db/
+
+# Environment variables
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

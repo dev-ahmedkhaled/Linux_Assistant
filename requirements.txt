@@ -1,0 +1,13 @@
+langchain
+langchain-community
+langchain-core
+langchain-ollama
+langgraph
+huggingface_hub
+ollama
+docker
+psutil
+chromadb
+nltk
+datasets
+evaluate
