@@ -11,3 +11,4 @@ chromadb
 nltk
 datasets
 evaluate
+gradio

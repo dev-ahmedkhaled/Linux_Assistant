@@ -1,768 +1,498 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║  NetSniff — TShark Network Sniffer Pipeline              ║
-║  Requirements: pip install gradio anthropic psutil       ║
-║  System:       sudo apt install tshark  (or wireshark)   ║
-║  Run:          sudo python network_sniffer.py            ║
+║  LinuxGPT — AI Linux Assistant                           ║
+║  Backend : Ollama (local LLM)                            ║
+║  UI      : Gradio  (clean modern dark)                   ║
+║                                                          ║
+║  Requirements:                                           ║
+║    pip install gradio psutil requests                    ║
+║    ollama pull llama3  (or any model you prefer)         ║
+║                                                          ║
+║  Run: python linux_assistant_ui.py                       ║
 ╚══════════════════════════════════════════════════════════╝
 """
-
-import gradio as gr
-import subprocess
-import threading
-import queue
-import json
-import re
 import os
-import shutil
 import time
-import ipaddress
-from collections import defaultdict, Counter
+import json
+import shutil
+import psutil
+import platform
+import requests
+import subprocess
+import gradio as gr
 from datetime import datetime
-import anthropic
 
 # ─────────────────────────────────────────────────────────
-# Globals
+# Config
 # ─────────────────────────────────────────────────────────
-client = anthropic.Anthropic()
 
-sniffer_process: subprocess.Popen | None = None
-sniffer_thread: threading.Thread | None = None
-packet_queue: queue.Queue = queue.Queue(maxsize=5000)
-is_running = threading.Event()
+OLLAMA_HOST  = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+DEFAULT_MODEL = os.environ.get("LINUX_ASSISTANT_MODEL", "llama3")
 
-# Stats counters (thread-safe via GIL on simple ops)
-stats = {
-    "total": 0,
-    "protocols": Counter(),
-    "src_ips": Counter(),
-    "dst_ips": Counter(),
-    "ports": Counter(),
-    "sizes": [],
-    "alerts": [],
-    "start_time": None,
+SYSTEM_PROMPT = """You are LinuxGPT, an expert Linux assistant. You help with:
+- Linux commands, shell scripting, and one-liners
+- Debugging errors and interpreting terminal output
+- System administration, networking, and performance tuning
+- Package management, file operations, and permissions
+- Explaining concepts clearly with practical examples
+
+Always format command examples in code blocks. Be concise but thorough.
+When you suggest commands, briefly explain what each flag does."""
+
+BLOCKED_CMDS = {
+    "rm -rf /", "rm -rf /*", "mkfs", "dd if=/dev/zero",
+    ":(){ :|:& };:", "chmod -R 777 /", "> /dev/sda",
+    "shutdown", "reboot", "halt", "poweroff",
 }
-stats_lock = threading.Lock()
 
-PCAP_PATH = "/tmp/netsniff_capture.pcap"
-
-# ─────────────────────────────────────────────────────────
-# TShark helpers
-# ─────────────────────────────────────────────────────────
-
-def check_tshark() -> tuple[bool, str]:
-    path = shutil.which("tshark")
-    if not path:
-        return False, "tshark not found. Install: sudo apt install tshark  (or brew install wireshark)"
-    try:
-        r = subprocess.run(["tshark", "--version"], capture_output=True, text=True, timeout=5)
-        ver = r.stdout.split("\n")[0]
-        return True, f"✓ {ver}  [{path}]"
-    except Exception as e:
-        return False, str(e)
-
-
-def list_interfaces() -> list[str]:
-    try:
-        r = subprocess.run(
-            ["tshark", "-D"], capture_output=True, text=True, timeout=5
-        )
-        ifaces = []
-        for line in r.stdout.strip().splitlines():
-            # e.g.  1. eth0
-            m = re.match(r"^\d+\.\s+(\S+)", line)
-            if m:
-                ifaces.append(m.group(1))
-        return ifaces if ifaces else ["eth0", "any"]
-    except Exception:
-        return ["eth0", "any", "lo"]
-
-
-# ─────────────────────────────────────────────────────────
-# Packet parsing
-# ─────────────────────────────────────────────────────────
-
-TSHARK_FIELDS = [
-    "frame.number",
-    "frame.time_relative",
-    "frame.len",
-    "eth.src",
-    "eth.dst",
-    "ip.src",
-    "ip.dst",
-    "ipv6.src",
-    "ipv6.dst",
-    "ip.proto",
-    "_ws.col.Protocol",
-    "tcp.srcport",
-    "tcp.dstport",
-    "udp.srcport",
-    "udp.dstport",
-    "tcp.flags",
-    "http.request.method",
-    "http.host",
-    "dns.qry.name",
-    "tls.handshake.type",
-    "icmp.type",
-    "frame.coloring_rule.name",
+QUICK_PROMPTS = [
+    ("📂 Disk usage", "Show me disk usage sorted by size for the current directory"),
+    ("🔍 Find large files", "How do I find the 10 largest files on my system?"),
+    ("🔒 Check permissions", "Explain Linux file permissions and how to fix 'permission denied'"),
+    ("🌐 Network debug", "How do I debug network connectivity issues in Linux?"),
+    ("⚙️  Running services", "How do I list all running services and check their status?"),
+    ("📋 View logs", "What are the best ways to view and filter system logs?"),
+    ("🔄 Background jobs", "Explain Linux job control: bg, fg, nohup, and screen/tmux"),
+    ("💾 Memory info", "How do I check memory usage and find memory-hungry processes?"),
 ]
 
-PROTO_COLORS = {
-    "TCP":   "#5eb8ff",
-    "UDP":   "#a78bfa",
-    "DNS":   "#fbbf24",
-    "HTTP":  "#34d399",
-    "HTTPS": "#34d399",
-    "TLS":   "#34d399",
-    "ICMP":  "#f87171",
-    "ARP":   "#fb923c",
-    "QUIC":  "#c084fc",
-    "OTHER": "#64748b",
-}
+# ─────────────────────────────────────────────────────────
+# Ollama helpers
+# ─────────────────────────────────────────────────────────
 
-SUSPICIOUS_PORTS = {22, 23, 4444, 1337, 31337, 6666, 6667, 9001, 12345}
-SUSPICIOUS_PATTERNS = ["nmap", "masscan", "sqlmap"]
-
-
-def parse_tshark_line(line: str) -> dict | None:
-    """Parse a tshark -T fields line (tab-separated)."""
-    parts = line.rstrip("\n").split("\t")
-    if len(parts) < 5:
-        return None
-
-    def get(i, default=""):
-        return parts[i].strip() if i < len(parts) else default
-
-    proto = get(10) or "OTHER"
-    src_ip = get(5) or get(7) or get(3)   # ipv4 / ipv6 / mac
-    dst_ip = get(6) or get(8) or get(4)
-    src_port = get(11) or get(13) or ""
-    dst_port = get(12) or get(14) or ""
-
+def list_ollama_models() -> list[str]:
+    """Return available models from Ollama, fallback to default."""
     try:
-        length = int(get(2)) if get(2) else 0
-    except ValueError:
-        length = 0
-
-    pkt = {
-        "num":       get(0),
-        "time":      get(1),
-        "len":       length,
-        "src_ip":    src_ip,
-        "dst_ip":    dst_ip,
-        "src_port":  src_port,
-        "dst_port":  dst_port,
-        "proto":     proto,
-        "flags":     get(15),
-        "http_meth": get(16),
-        "http_host": get(17),
-        "dns_name":  get(18),
-        "tls_type":  get(19),
-        "icmp_type": get(20),
-        "color_rule":get(21),
-        "ts":        datetime.now().strftime("%H:%M:%S.%f")[:-3],
-    }
-
-    # ── Heuristic alerts ──
-    alerts = []
-    try:
-        dp = int(dst_port) if dst_port else 0
-        sp = int(src_port) if src_port else 0
-        if dp in SUSPICIOUS_PORTS or sp in SUSPICIOUS_PORTS:
-            alerts.append(f"⚠ Suspicious port {dp or sp}")
-    except ValueError:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        if r.ok:
+            models = [m["name"] for m in r.json().get("models", [])]
+            return models if models else [DEFAULT_MODEL]
+    except Exception:
         pass
-
-    if pkt["flags"]:
-        flags = int(pkt["flags"], 16) if pkt["flags"].startswith("0x") else 0
-        # SYN scan: SYN only (0x002)
-        if flags == 0x002:
-            alerts.append("⚠ SYN-only packet (possible scan)")
-        # XMAS scan: FIN+PSH+URG
-        if flags & 0x029 == 0x029:
-            alerts.append("🚨 XMAS scan detected")
-        # NULL scan
-        if flags == 0x000:
-            alerts.append("⚠ NULL scan")
-        # RST flood heuristic
-        if flags & 0x004:
-            alerts.append("↯ RST flag")
-
-    pkt["alerts"] = alerts
-    return pkt
+    return [DEFAULT_MODEL]
 
 
-def update_stats(pkt: dict):
-    with stats_lock:
-        stats["total"] += 1
-        proto = pkt["proto"] or "OTHER"
-        stats["protocols"][proto] += 1
-        if pkt["src_ip"]:
-            stats["src_ips"][pkt["src_ip"]] += 1
-        if pkt["dst_ip"]:
-            stats["dst_ips"][pkt["dst_ip"]] += 1
-        if pkt["dst_port"]:
-            stats["ports"][pkt["dst_port"]] += 1
-        if pkt["len"]:
-            stats["sizes"].append(pkt["len"])
-        for alert in pkt["alerts"]:
-            stats["alerts"].append({
-                "ts": pkt["ts"],
-                "alert": alert,
-                "src": pkt["src_ip"],
-                "dst": pkt["dst_ip"],
-                "proto": proto,
-            })
-        # Keep alerts bounded
-        if len(stats["alerts"]) > 200:
-            stats["alerts"] = stats["alerts"][-200:]
+def check_ollama() -> tuple[bool, str]:
+    """Check if Ollama is reachable."""
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        if r.ok:
+            models = r.json().get("models", [])
+            return True, f"Ollama running · {len(models)} model(s) available"
+    except requests.ConnectionError:
+        return False, "Cannot reach Ollama — is it running? (ollama serve)"
+    except Exception as e:
+        return False, str(e)
+    return False, "Ollama returned an unexpected response"
+
+
+def stream_ollama(model: str, messages: list[dict]) -> str:
+    """Stream a response from Ollama and yield chunks."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+    }
+    try:
+        with requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json=payload,
+            stream=True,
+            timeout=120,
+        ) as resp:
+            resp.raise_for_status()
+            full = ""
+            for line in resp.iter_lines():
+                if line:
+                    chunk = json.loads(line)
+                    delta = chunk.get("message", {}).get("content", "")
+                    full += delta
+                    yield full
+    except requests.ConnectionError:
+        yield "❌ **Ollama not reachable.** Make sure `ollama serve` is running."
+    except Exception as e:
+        yield f"❌ **Error:** {e}"
 
 
 # ─────────────────────────────────────────────────────────
-# Capture thread
+# System stats
 # ─────────────────────────────────────────────────────────
 
-def _capture_thread(interface: str, bpf_filter: str, ring_file: bool):
-    global sniffer_process
-
-    field_args = []
-    for f in TSHARK_FIELDS:
-        field_args += ["-e", f]
-
-    cmd = [
-        "tshark",
-        "-i", interface,
-        "-T", "fields",
-        "-E", "separator=\t",
-        "-E", "occurrence=f",      # first occurrence of repeated fields
-        "-l",                       # line-buffered
-        "--no-duplicate-keys",
-    ] + field_args
-
-    if bpf_filter.strip():
-        cmd += ["-f", bpf_filter.strip()]
-
-    if ring_file:
-        cmd += ["-w", PCAP_PATH, "-P"]  # -P: still print to stdout
+def get_system_stats() -> str:
+    """Return a markdown summary of live system stats."""
+    cpu = psutil.cpu_percent(interval=0.5)
+    ram = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    boot = datetime.fromtimestamp(psutil.boot_time())
+    uptime_secs = int(time.time() - psutil.boot_time())
+    h, r = divmod(uptime_secs, 3600)
+    m, s = divmod(r, 60)
+    uptime_str = f"{h}h {m}m {s}s"
 
     try:
-        sniffer_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
+        uname = platform.uname()
+        os_info = f"{uname.system} {uname.release}"
+    except Exception:
+        os_info = platform.system()
 
-        for line in sniffer_process.stdout:
-            if not is_running.is_set():
-                break
-            pkt = parse_tshark_line(line)
-            if pkt:
-                update_stats(pkt)
-                try:
-                    packet_queue.put_nowait(pkt)
-                except queue.Full:
-                    try:
-                        packet_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    packet_queue.put_nowait(pkt)
+    def bar(pct, width=20):
+        filled = int(pct / 100 * width)
+        return "█" * filled + "░" * (width - filled)
 
-    except Exception as e:
-        packet_queue.put_nowait({"_error": str(e)})
-    finally:
-        if sniffer_process:
-            sniffer_process.terminate()
-
-
-# ─────────────────────────────────────────────────────────
-# Start / Stop
-# ─────────────────────────────────────────────────────────
-
-def start_capture(interface: str, bpf_filter: str, save_pcap: bool):
-    global sniffer_thread
-
-    if is_running.is_set():
-        return "⚠️ Capture already running."
-
-    ok, msg = check_tshark()
-    if not ok:
-        return f"❌ {msg}"
-
-    # Reset stats
-    with stats_lock:
-        stats["total"] = 0
-        stats["protocols"].clear()
-        stats["src_ips"].clear()
-        stats["dst_ips"].clear()
-        stats["ports"].clear()
-        stats["sizes"].clear()
-        stats["alerts"].clear()
-        stats["start_time"] = time.time()
-
-    # Drain queue
-    while not packet_queue.empty():
-        try:
-            packet_queue.get_nowait()
-        except queue.Empty:
-            break
-
-    is_running.set()
-    sniffer_thread = threading.Thread(
-        target=_capture_thread,
-        args=(interface, bpf_filter, save_pcap),
-        daemon=True,
-    )
-    sniffer_thread.start()
-    return f"▶ Capture started on **{interface}**" + (f" | filter: `{bpf_filter}`" if bpf_filter else "") + (f" | saving to `{PCAP_PATH}`" if save_pcap else "")
-
-
-def stop_capture():
-    global sniffer_process
-    is_running.clear()
-    if sniffer_process:
-        try:
-            sniffer_process.terminate()
-            sniffer_process.wait(timeout=3)
-        except Exception:
-            pass
-        sniffer_process = None
-    return "■ Capture stopped."
-
-
-# ─────────────────────────────────────────────────────────
-# UI data fetchers (called by Gradio timers)
-# ─────────────────────────────────────────────────────────
-
-# Rolling packet log (last 200)
-_packet_log: list[dict] = []
-_packet_log_lock = threading.Lock()
-
-def drain_queue_to_log():
-    while not packet_queue.empty():
-        try:
-            pkt = packet_queue.get_nowait()
-            with _packet_log_lock:
-                _packet_log.append(pkt)
-                if len(_packet_log) > 200:
-                    _packet_log.pop(0)
-        except queue.Empty:
-            break
-
-
-def get_packet_table() -> list[list]:
-    drain_queue_to_log()
-    rows = []
-    with _packet_log_lock:
-        for p in reversed(_packet_log[-60:]):
-            if "_error" in p:
-                rows.append(["ERR", "", p["_error"], "", "", "", "", ""])
-                continue
-            alert_icon = "🚨" if p.get("alerts") else ""
-            rows.append([
-                p.get("ts", ""),
-                p.get("proto", ""),
-                p.get("src_ip", ""),
-                p.get("src_port", ""),
-                p.get("dst_ip", ""),
-                p.get("dst_port", ""),
-                p.get("len", ""),
-                p.get("dns_name", "") or p.get("http_host", "") or alert_icon,
-            ])
-    return rows
-
-
-def get_stats_md() -> str:
-    drain_queue_to_log()
-    with stats_lock:
-        total = stats["total"]
-        elapsed = time.time() - stats["start_time"] if stats["start_time"] else 0
-        pps = total / elapsed if elapsed > 0 else 0
-        top_protos = stats["protocols"].most_common(8)
-        top_src = stats["src_ips"].most_common(5)
-        top_dst = stats["dst_ips"].most_common(5)
-        top_ports = stats["ports"].most_common(8)
-        alert_count = len(stats["alerts"])
-        sizes = stats["sizes"]
-        avg_size = sum(sizes) / len(sizes) if sizes else 0
-        total_bytes = sum(sizes)
-
-    running = "🟢 **LIVE**" if is_running.is_set() else "⬛ **STOPPED**"
+    ram_used_gb = ram.used / 1024**3
+    ram_total_gb = ram.total / 1024**3
+    disk_used_gb = disk.used / 1024**3
+    disk_total_gb = disk.total / 1024**3
 
     lines = [
-        f"### {running}",
-        f"**Packets:** {total:,}  |  **{pps:.1f} pkt/s**  |  **{elapsed:.0f}s elapsed**",
-        f"**Total bytes:** {total_bytes/1024:.1f} KB  |  **Avg pkt:** {avg_size:.0f} B",
-        f"**Alerts:** {'🚨 ' if alert_count else ''}{alert_count}",
+        f"**OS:** `{os_info}` &nbsp;|&nbsp; **Uptime:** `{uptime_str}`",
         "",
-        "#### Protocol Distribution",
+        f"**CPU** &nbsp;{cpu:.1f}%",
+        f"`{bar(cpu)}`",
+        "",
+        f"**RAM** &nbsp;{ram_used_gb:.1f} / {ram_total_gb:.1f} GB &nbsp;({ram.percent:.1f}%)",
+        f"`{bar(ram.percent)}`",
+        "",
+        f"**Disk** &nbsp;{disk_used_gb:.1f} / {disk_total_gb:.1f} GB &nbsp;({disk.percent:.1f}%)",
+        f"`{bar(disk.percent)}`",
     ]
-    for proto, cnt in top_protos:
-        bar = "█" * min(30, int(cnt / max(total, 1) * 30))
-        pct = cnt / max(total, 1) * 100
-        lines.append(f"`{proto:<8}` {bar} {cnt} ({pct:.1f}%)")
 
-    lines += ["", "#### Top Source IPs"]
-    for ip, cnt in top_src:
-        lines.append(f"  `{ip}` → {cnt} pkts")
-
-    lines += ["", "#### Top Destination IPs"]
-    for ip, cnt in top_dst:
-        lines.append(f"  `{ip}` → {cnt} pkts")
-
-    lines += ["", "#### Top Destination Ports"]
-    for port, cnt in top_ports:
-        lines.append(f"  :{port} → {cnt} pkts")
-
-    return "\n".join(lines)
-
-
-def get_alerts_md() -> str:
-    with stats_lock:
-        alerts = list(stats["alerts"][-30:])
-    if not alerts:
-        return "_No alerts yet._"
-    lines = ["| Time | Alert | Src → Dst | Proto |", "|---|---|---|---|"]
-    for a in reversed(alerts):
-        lines.append(f"| `{a['ts']}` | {a['alert']} | `{a['src']}` → `{a['dst']}` | {a['proto']} |")
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────
-# AI Analysis
-# ─────────────────────────────────────────────────────────
-
-AI_SYSTEM = """You are a network security analyst. Analyze the provided network capture statistics and packet samples.
-Identify:
-- Anomalies or suspicious patterns
-- Protocol distribution insights
-- Potential security threats (port scans, floods, unusual connections)
-- Top talkers and what they might indicate
-- Any DNS or HTTP observations
-Be concise, technical, and actionable. Use bullet points."""
-
-def ai_analyze() -> str:
-    with stats_lock:
-        snapshot = {
-            "total_packets": stats["total"],
-            "protocols": dict(stats["protocols"].most_common(15)),
-            "top_src_ips": dict(stats["src_ips"].most_common(10)),
-            "top_dst_ips": dict(stats["dst_ips"].most_common(10)),
-            "top_dst_ports": dict(stats["ports"].most_common(15)),
-            "alert_count": len(stats["alerts"]),
-            "recent_alerts": stats["alerts"][-10:],
-            "avg_packet_size": (
-                sum(stats["sizes"]) / len(stats["sizes"]) if stats["sizes"] else 0
-            ),
-        }
-
-    with _packet_log_lock:
-        sample = _packet_log[-20:]
-
-    prompt = f"""Network capture statistics:
-{json.dumps(snapshot, indent=2)}
-
-Recent packet sample (last 20):
-{json.dumps(sample, indent=2, default=str)}
-
-Provide a security analysis."""
-
+    # Top 5 processes by CPU
     try:
-        result = ""
-        with client.messages.stream(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=AI_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
-            for text in stream.text_stream:
-                result += text
-        return result
-    except Exception as e:
-        return f"❌ AI Error: {e}"
+        procs = sorted(
+            psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]),
+            key=lambda p: p.info["cpu_percent"] or 0,
+            reverse=True,
+        )[:5]
+        lines += ["", "**Top Processes**"]
+        for p in procs:
+            name = (p.info["name"] or "?")[:18]
+            cpu_p = p.info["cpu_percent"] or 0
+            mem_p = p.info["memory_percent"] or 0
+            lines.append(f"`{p.info['pid']:>6}` `{name:<18}` CPU {cpu_p:>5.1f}%  MEM {mem_p:>4.1f}%")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
 
 
-def run_tshark_cmd(cmd: str) -> str:
-    """Run an arbitrary tshark/tcpdump analysis command against the saved pcap."""
+# ─────────────────────────────────────────────────────────
+# Shell command runner
+# ─────────────────────────────────────────────────────────
+
+def run_command(cmd: str) -> str:
+    """Run a shell command safely and return output."""
     if not cmd.strip():
         return ""
-    BLOCKED = ["rm ", "mkfs", ">", ">>", "|", ";", "&"]
-    for b in BLOCKED:
-        if b in cmd and b != "|":   # allow pipe in tshark -r
-            return f"⛔ Blocked token: '{b}'"
+    # Safety check
+    cmd_lower = cmd.strip().lower()
+    for blocked in BLOCKED_CMDS:
+        if blocked in cmd_lower:
+            return f"⛔ **Blocked:** `{blocked}` is not allowed for safety reasons."
+
     try:
-        # Auto-inject pcap path if -r not present
-        if "-r" not in cmd and os.path.exists(PCAP_PATH):
-            cmd = cmd.rstrip() + f" -r {PCAP_PATH}"
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=20
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        out = result.stdout.strip() or result.stderr.strip() or "(no output)"
-        return out[:4000]   # truncate for display
+        out = result.stdout.strip()
+        err = result.stderr.strip()
+        code = result.returncode
+
+        parts = []
+        if out:
+            parts.append(f"```\n{out}\n```")
+        if err:
+            parts.append(f"**stderr:**\n```\n{err}\n```")
+        if not out and not err:
+            parts.append(f"*(no output — exit code {code})*")
+        if code != 0:
+            parts.append(f"*Exit code: {code}*")
+        return "\n".join(parts)
+
     except subprocess.TimeoutExpired:
-        return "⏱ Timed out"
+        return "⏱ **Timeout** — command took more than 30 seconds."
     except Exception as e:
-        return f"❌ {e}"
+        return f"❌ **Error:** {e}"
 
 
 # ─────────────────────────────────────────────────────────
-# CSS
+# Chat logic
+# ─────────────────────────────────────────────────────────
+
+def build_messages(history: list, user_msg: str, paste_ctx: str) -> list[dict]:
+    """Assemble the Ollama messages list."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    for role, content in history:
+        messages.append({"role": "user" if role == "user" else "assistant", "content": content})
+
+    # Append pasted context if present
+    if paste_ctx.strip():
+        user_msg = f"{user_msg}\n\n**Terminal output to analyse:**\n```\n{paste_ctx.strip()}\n```"
+
+    messages.append({"role": "user", "content": user_msg})
+    return messages
+
+
+def chat(user_msg, history, model, paste_ctx):
+    """Called by Gradio chat submit — streams the reply."""
+    if not user_msg.strip():
+        yield history, ""
+        return
+
+    messages = build_messages(history, user_msg, paste_ctx)
+    history = history + [("user", user_msg)]
+    partial = ""
+
+    for chunk in stream_ollama(model, messages):
+        partial = chunk
+        display = history + [("assistant", partial)]
+        yield display, ""
+
+    # Final yield — clear paste box after send
+    yield history + [("assistant", partial)], ""
+
+
+def clear_chat():
+    return [], "", ""
+
+
+def apply_quick_prompt(prompt_text):
+    return prompt_text
+
+
+def refresh_stats():
+    return get_system_stats()
+
+
+# ─────────────────────────────────────────────────────────
+# CSS  — clean modern dark
 # ─────────────────────────────────────────────────────────
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;400;600;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap');
 
 :root {
-    --bg:        #060a0f;
-    --bg2:       #0b1118;
-    --bg3:       #111922;
-    --bg4:       #1a2535;
-    --border:    #1e3048;
-    --cyan:      #00e5ff;
-    --cyan-dim:  #005f6b;
-    --green:     #00ff9d;
-    --red:       #ff3d5a;
-    --orange:    #ffaa00;
-    --yellow:    #ffd600;
-    --text:      #b0c4d8;
-    --text-dim:  #3a5068;
-    --mono:      'Share Tech Mono', monospace;
-    --sans:      'Exo 2', sans-serif;
+    --bg-base:    #0f1117;
+    --bg-surface: #161b27;
+    --bg-card:    #1c2333;
+    --bg-input:   #1e2638;
+    --border:     #2a3348;
+    --border-hi:  #3d4f70;
+    --accent:     #4f8ef7;
+    --accent-dim: #1e3a6e;
+    --green:      #3dd68c;
+    --red:        #f76f6f;
+    --amber:      #f5a623;
+    --text-1:     #e8edf5;
+    --text-2:     #8b99b5;
+    --text-3:     #4a566e;
+    --mono:       'DM Mono', monospace;
+    --sans:       'DM Sans', sans-serif;
+    --radius:     10px;
+    --radius-sm:  6px;
 }
 
 *, *::before, *::after { box-sizing: border-box; }
 
 body, .gradio-container {
-    background: var(--bg) !important;
+    background: var(--bg-base) !important;
     font-family: var(--sans) !important;
-    color: var(--text) !important;
+    color: var(--text-1) !important;
+    font-size: 14px !important;
 }
 
-.gradio-container { max-width: 1400px !important; padding: 0 !important; }
+.gradio-container { max-width: 1280px !important; margin: 0 auto !important; padding: 0 16px !important; }
 
-/* Scanline overlay effect */
-.gradio-container::before {
-    content: '';
-    position: fixed;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: repeating-linear-gradient(
-        0deg,
-        transparent,
-        transparent 2px,
-        rgba(0,229,255,0.012) 2px,
-        rgba(0,229,255,0.012) 4px
-    );
-    pointer-events: none;
-    z-index: 9999;
-}
-
-/* Header */
-#hdr {
-    background: linear-gradient(90deg, #060a0f 0%, #0a1520 50%, #060a0f 100%);
-    border-bottom: 1px solid var(--cyan-dim);
-    padding: 18px 32px;
+/* ── App header ── */
+#app-header {
+    padding: 20px 0 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 20px;
     display: flex;
     align-items: center;
-    gap: 24px;
-    position: relative;
-    overflow: hidden;
+    gap: 16px;
 }
-#hdr::after {
-    content: '';
-    position: absolute;
-    bottom: 0; left: 0; right: 0;
-    height: 1px;
-    background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+#app-header .logo {
+    width: 40px; height: 40px;
+    background: var(--accent-dim);
+    border-radius: var(--radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-weight: 500; font-size: 18px; color: var(--accent);
 }
-#hdr h1 {
-    font-family: var(--mono);
-    font-size: 1.5rem;
-    color: var(--cyan);
-    margin: 0;
-    text-shadow: 0 0 20px rgba(0,229,255,0.5);
-    letter-spacing: 2px;
+#app-header h1 {
+    font-family: var(--sans); font-size: 20px; font-weight: 600;
+    color: var(--text-1); margin: 0; letter-spacing: -0.3px;
 }
-#hdr .sub {
-    font-family: var(--mono);
-    font-size: 0.72rem;
-    color: var(--text-dim);
-    letter-spacing: 1px;
+#app-header .sub {
+    font-size: 12px; color: var(--text-2); margin: 2px 0 0;
 }
-.blink { animation: blink 1s step-end infinite; }
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
-
-/* Panel */
-.pnl {
-    background: var(--bg2);
+#status-pill {
+    margin-left: auto;
+    background: var(--bg-card);
     border: 1px solid var(--border);
-    border-radius: 3px;
-    overflow: hidden;
-    margin-bottom: 10px;
-}
-.pnl-hdr {
-    background: var(--bg3);
-    padding: 7px 14px;
+    border-radius: 20px;
+    padding: 5px 14px;
     font-family: var(--mono);
-    font-size: 0.7rem;
-    color: var(--cyan);
-    letter-spacing: 2px;
-    text-transform: uppercase;
+    font-size: 11px;
+    color: var(--text-2);
+}
+#status-pill.ok  { border-color: var(--green); color: var(--green); }
+#status-pill.err { border-color: var(--red);   color: var(--red); }
+
+/* ── Section labels ── */
+.section-label {
+    font-size: 10px; font-weight: 600; letter-spacing: 1.5px;
+    text-transform: uppercase; color: var(--text-3);
+    margin: 0 0 10px; padding: 0;
+}
+
+/* ── Panels / cards ── */
+.panel {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+.panel-head {
+    padding: 10px 16px;
     border-bottom: 1px solid var(--border);
+    font-size: 11px; font-weight: 600; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--text-2);
+    background: var(--bg-card);
 }
 
-/* Inputs */
-input, textarea, select {
-    background: var(--bg3) !important;
+/* ── Inputs ── */
+input[type=text], textarea, .gr-input, .gr-textarea {
+    background: var(--bg-input) !important;
     border: 1px solid var(--border) !important;
-    color: var(--text) !important;
-    font-family: var(--mono) !important;
-    font-size: 0.85rem !important;
-    border-radius: 3px !important;
-    caret-color: var(--cyan) !important;
+    color: var(--text-1) !important;
+    font-family: var(--sans) !important;
+    font-size: 14px !important;
+    border-radius: var(--radius-sm) !important;
+    caret-color: var(--accent) !important;
+    transition: border-color .15s !important;
 }
-input:focus, textarea:focus {
-    border-color: var(--cyan) !important;
-    box-shadow: 0 0 0 2px rgba(0,229,255,0.1) !important;
+input[type=text]:focus, textarea:focus {
+    border-color: var(--accent) !important;
     outline: none !important;
+    box-shadow: 0 0 0 3px rgba(79,142,247,.12) !important;
 }
 
-/* Buttons */
-button.primary {
-    background: linear-gradient(135deg, #00e5ff 0%, #006080 100%) !important;
+/* ── Buttons ── */
+button { font-family: var(--sans) !important; }
+
+button.primary, .gr-button-primary {
+    background: var(--accent) !important;
     border: none !important;
-    color: #000 !important;
-    font-family: var(--mono) !important;
-    font-weight: 700 !important;
-    font-size: 0.8rem !important;
-    letter-spacing: 2px !important;
-    text-transform: uppercase !important;
-    border-radius: 3px !important;
-    padding: 10px 18px !important;
-    transition: all 0.2s !important;
-    box-shadow: 0 0 12px rgba(0,229,255,0.3) !important;
+    color: #fff !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    border-radius: var(--radius-sm) !important;
+    padding: 9px 18px !important;
+    transition: opacity .15s, transform .1s !important;
 }
-button.primary:hover {
-    box-shadow: 0 0 24px rgba(0,229,255,0.6) !important;
-    filter: brightness(1.1) !important;
-}
-button.secondary {
-    background: var(--bg4) !important;
+button.primary:hover { opacity: .88 !important; }
+button.primary:active { transform: scale(.97) !important; }
+
+button.secondary, .gr-button-secondary {
+    background: var(--bg-card) !important;
     border: 1px solid var(--border) !important;
-    color: var(--text) !important;
-    font-family: var(--mono) !important;
-    font-size: 0.78rem !important;
-    border-radius: 3px !important;
-    letter-spacing: 1px !important;
-    transition: all 0.2s !important;
+    color: var(--text-2) !important;
+    font-size: 12px !important;
+    border-radius: var(--radius-sm) !important;
+    padding: 7px 14px !important;
+    transition: border-color .15s, color .15s !important;
 }
 button.secondary:hover {
-    border-color: var(--red) !important;
-    color: var(--red) !important;
-    box-shadow: 0 0 8px rgba(255,61,90,0.2) !important;
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
 }
 
-/* Dataframe / table */
-.svelte-15lo0d8 table, table {
-    background: var(--bg2) !important;
+/* ── Chatbot ── */
+.gr-chatbot, [class*="chatbot"] {
+    background: var(--bg-surface) !important;
     border: 1px solid var(--border) !important;
-    font-family: var(--mono) !important;
-    font-size: 0.78rem !important;
+    border-radius: var(--radius) !important;
 }
-.svelte-15lo0d8 th, th {
-    background: var(--bg3) !important;
-    color: var(--cyan) !important;
-    border-bottom: 1px solid var(--border) !important;
-    letter-spacing: 1px !important;
-    padding: 6px 10px !important;
-}
-.svelte-15lo0d8 td, td {
-    color: var(--text) !important;
-    border-bottom: 1px solid rgba(30,48,72,0.5) !important;
-    padding: 4px 10px !important;
-}
-.svelte-15lo0d8 tr:hover td, tr:hover td {
-    background: var(--bg3) !important;
-}
+.message.user    { background: var(--accent-dim) !important; color: var(--text-1) !important; border-radius: 12px 12px 2px 12px !important; }
+.message.bot     { background: var(--bg-card)    !important; color: var(--text-1) !important; border-radius: 12px 12px 12px 2px !important; border: 1px solid var(--border) !important; }
+.message.user .md, .message.bot .md { font-family: var(--sans) !important; font-size: 14px !important; line-height: 1.65 !important; }
+.message code { background: rgba(0,0,0,.4) !important; font-family: var(--mono) !important; font-size: 12px !important; padding: 1px 6px !important; border-radius: 4px !important; color: #93c5fd !important; }
+.message pre  { background: #0a0e18 !important; border: 1px solid var(--border) !important; border-radius: var(--radius-sm) !important; padding: 12px !important; }
+.message pre code { background: transparent !important; color: var(--green) !important; font-size: 12px !important; }
 
-/* Markdown */
-.prose, .markdown-body, .md {
+/* ── Markdown (stats panel) ── */
+.gr-markdown { color: var(--text-1) !important; }
+.gr-markdown code { background: var(--bg-card) !important; color: var(--green) !important; font-family: var(--mono) !important; font-size: 11.5px !important; padding: 2px 6px !important; border-radius: 4px !important; }
+.gr-markdown strong { color: var(--text-1) !important; font-weight: 600 !important; }
+
+/* ── Dropdown ── */
+.gr-dropdown, select {
+    background: var(--bg-input) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text-1) !important;
     font-family: var(--sans) !important;
-    color: var(--text) !important;
-}
-.prose code, .markdown-body code {
-    background: var(--bg3) !important;
-    color: var(--cyan) !important;
-    font-family: var(--mono) !important;
-    font-size: 0.82rem !important;
-    padding: 1px 5px !important;
-    border-radius: 2px !important;
-}
-.prose pre, .markdown-body pre {
-    background: var(--bg) !important;
-    border: 1px solid var(--border) !important;
-    border-left: 3px solid var(--cyan) !important;
-    border-radius: 3px !important;
+    font-size: 13px !important;
+    border-radius: var(--radius-sm) !important;
 }
 
-/* Labels */
-label > span, .label-wrap span {
-    font-family: var(--mono) !important;
-    font-size: 0.68rem !important;
-    letter-spacing: 1.5px !important;
-    text-transform: uppercase !important;
-    color: var(--text-dim) !important;
-}
-
-/* Tabs */
-.tab-nav button {
-    font-family: var(--mono) !important;
-    font-size: 0.78rem !important;
-    letter-spacing: 1px !important;
-    color: var(--text-dim) !important;
-    border: none !important;
+/* ── Tabs ── */
+.tabs .tab-nav button {
+    font-family: var(--sans) !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    color: var(--text-2) !important;
     background: transparent !important;
-    padding: 10px 20px !important;
+    border: none !important;
     border-bottom: 2px solid transparent !important;
+    padding: 10px 20px !important;
+    transition: color .15s, border-color .15s !important;
 }
-.tab-nav button.selected {
-    color: var(--cyan) !important;
-    border-bottom: 2px solid var(--cyan) !important;
-    text-shadow: 0 0 8px rgba(0,229,255,0.4) !important;
+.tabs .tab-nav button.selected {
+    color: var(--accent) !important;
+    border-bottom-color: var(--accent) !important;
 }
+.tabs { border-bottom: 1px solid var(--border) !important; margin-bottom: 16px !important; }
 
-/* Status bar */
-#statusbar {
-    font-family: var(--mono);
-    font-size: 0.75rem;
-    padding: 6px 16px;
-    background: var(--bg3);
-    border-top: 1px solid var(--border);
-    color: var(--text-dim);
-    display: flex;
-    gap: 20px;
-    letter-spacing: 0.5px;
-}
-#statusbar .ok  { color: var(--green); }
-#statusbar .err { color: var(--red); }
-
-/* Alert highlight */
-.alert-box {
-    background: rgba(255,61,90,0.06);
-    border: 1px solid rgba(255,61,90,0.3);
-    border-left: 3px solid var(--red);
-    border-radius: 3px;
-    padding: 10px 14px;
-}
-
-/* AI output */
-#ai-out textarea {
-    background: #03060a !important;
-    color: var(--green) !important;
+/* ── Command output ── */
+#cmd-output textarea {
     font-family: var(--mono) !important;
-    font-size: 0.82rem !important;
-    min-height: 220px !important;
+    font-size: 12.5px !important;
+    color: var(--green) !important;
+    background: #070b12 !important;
+    border: 1px solid var(--border) !important;
+    min-height: 140px !important;
+    line-height: 1.6 !important;
 }
+
+/* ── Labels ── */
+label > span, .label-wrap span {
+    font-family: var(--sans) !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    letter-spacing: .8px !important;
+    text-transform: uppercase !important;
+    color: var(--text-3) !important;
+}
+
+/* ── Footer ── */
+#footer {
+    text-align: center; padding: 16px;
+    font-size: 11px; color: var(--text-3);
+    border-top: 1px solid var(--border); margin-top: 24px;
+    font-family: var(--mono);
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-hi); }
 """
 
 # ─────────────────────────────────────────────────────────
@@ -770,278 +500,350 @@ label > span, .label-wrap span {
 # ─────────────────────────────────────────────────────────
 
 def build_ui():
-    ifaces = list_interfaces()
-    ok, tshark_ver = check_tshark()
+    ok, status_msg = check_ollama()
+    models = list_ollama_models()
+    status_class = "ok" if ok else "err"
+    status_icon  = "● " if ok else "✕ "
 
-    with gr.Blocks(css=CSS, title="NetSniff · TShark Pipeline", theme=gr.themes.Base()) as demo:
+    with gr.Blocks(css=CSS, title="LinuxGPT", theme=gr.themes.Base()) as demo:
 
         # ── Header ──
-        status_color = "ok" if ok else "err"
         gr.HTML(f"""
-        <div id="hdr">
+        <div id="app-header">
+          <div class="logo">&gt;_</div>
           <div>
-            <h1>◈ NETSNIFF</h1>
-            <div class="sub">TSHARK CAPTURE PIPELINE · REAL-TIME NETWORK ANALYSIS</div>
+            <h1>LinuxGPT</h1>
+            <div class="sub">AI-powered Linux assistant · Ollama backend</div>
           </div>
-          <div style="margin-left:auto;font-family:var(--mono,monospace);font-size:0.72rem;">
-            <span class="{status_color}">{tshark_ver}</span>
-          </div>
+          <div id="status-pill" class="{status_class}">{status_icon}{status_msg}</div>
         </div>
         """)
 
         with gr.Tabs():
 
-            # ════════════════════════════════
-            # TAB 1 — CAPTURE
-            # ════════════════════════════════
-            with gr.Tab("▶  CAPTURE"):
-                with gr.Row():
-                    # Controls
-                    with gr.Column(scale=1, min_width=280):
-                        gr.HTML('<div class="pnl-hdr">Capture Settings</div>')
-                        iface_dd = gr.Dropdown(
-                            choices=ifaces,
-                            value=ifaces[0] if ifaces else "eth0",
-                            label="Interface",
+            # ═══════════════════════════════════════
+            # TAB 1 — CHAT
+            # ═══════════════════════════════════════
+            with gr.Tab("💬  Chat"):
+                with gr.Row(equal_height=False):
+
+                    # Left sidebar
+                    with gr.Column(scale=1, min_width=240):
+                        gr.HTML('<p class="section-label">Model</p>')
+                        model_dd = gr.Dropdown(
+                            choices=models,
+                            value=models[0] if models else DEFAULT_MODEL,
+                            label="",
+                            interactive=True,
                         )
-                        bpf_input = gr.Textbox(
-                            placeholder='e.g.  tcp port 80  or  not port 22',
-                            label="BPF Filter (optional)",
-                            value="",
+
+                        gr.HTML('<p class="section-label" style="margin-top:20px">Quick Prompts</p>')
+                        for icon_label, prompt_text in QUICK_PROMPTS:
+                            btn = gr.Button(icon_label, variant="secondary", size="sm")
+                            btn.click(
+                                fn=apply_quick_prompt,
+                                inputs=gr.State(prompt_text),
+                                outputs=gr.Textbox(visible=False),  # temp, wired below
+                            )
+
+                        gr.HTML('<p class="section-label" style="margin-top:20px">Paste Terminal Output</p>')
+                        paste_box = gr.Textbox(
+                            placeholder="Paste error or command output here…\nClaude will use it as context.",
+                            label="",
+                            lines=6,
+                            max_lines=12,
                         )
-                        save_pcap = gr.Checkbox(label=f"Save PCAP → {PCAP_PATH}", value=True)
+                        clear_paste_btn = gr.Button("Clear paste", variant="secondary", size="sm")
+                        clear_paste_btn.click(fn=lambda: "", outputs=paste_box)
 
-                        with gr.Row():
-                            start_btn = gr.Button("▶ START", variant="primary")
-                            stop_btn  = gr.Button("■ STOP",  variant="secondary")
-
-                        capture_status = gr.Markdown("_Ready._")
-
-                        gr.HTML('<div class="pnl-hdr" style="margin-top:12px;">Quick BPF Filters</div>')
-                        for label, flt in [
-                            ("🌐 HTTP/HTTPS",   "tcp port 80 or tcp port 443"),
-                            ("🔎 DNS only",      "udp port 53"),
-                            ("🏓 ICMP only",     "icmp"),
-                            ("📡 No local",      "not src net 192.168.0.0/16"),
-                            ("🔑 SSH traffic",   "tcp port 22"),
-                            ("📤 Outbound only", "src net 192.168.0.0/16"),
-                        ]:
-                            b = gr.Button(label, variant="secondary", size="sm")
-                            b.click(lambda f=flt: f, outputs=bpf_input)
-
-                    # Live packet table
+                    # Main chat area
                     with gr.Column(scale=3):
-                        gr.HTML('<div class="pnl-hdr">Live Packets <span class="blink">●</span></div>')
-                        pkt_table = gr.Dataframe(
-                            headers=["Time", "Protocol", "Src IP", "Sport", "Dst IP", "Dport", "Bytes", "Info"],
-                            datatype=["str","str","str","str","str","str","number","str"],
-                            value=[],
-                            row_count=(20, "fixed"),
-                            col_count=(8, "fixed"),
-                            interactive=False,
-                            wrap=False,
+                        chatbot = gr.Chatbot(
+                            label="",
+                            height=520,
+                            show_label=False,
+                            show_copy_button=True,
+                            bubble_full_width=False,
+                        )
+                        with gr.Row():
+                            user_input = gr.Textbox(
+                                placeholder="Ask anything Linux — commands, debugging, scripting…",
+                                label="",
+                                scale=5,
+                                show_label=False,
+                                container=False,
+                            )
+                            send_btn = gr.Button("Send ↑", variant="primary", scale=1)
+                        with gr.Row():
+                            clear_btn = gr.Button("Clear chat", variant="secondary", size="sm")
+
+                # Wire quick-prompt buttons properly
+                qp_state = gr.State("")
+                for icon_label, prompt_text in QUICK_PROMPTS:
+                    pass  # re-wired below with the actual user_input component
+
+                # Chat submit
+                submit_args = dict(
+                    fn=chat,
+                    inputs=[user_input, chatbot, model_dd, paste_box],
+                    outputs=[chatbot, user_input],
+                )
+                send_btn.click(**submit_args)
+                user_input.submit(**submit_args)
+                clear_btn.click(fn=clear_chat, outputs=[chatbot, user_input, paste_box])
+
+                # Quick prompts → user input
+                for icon_label, prompt_text in QUICK_PROMPTS:
+                    # Re-find button — rebuild reference by recreating inside loop
+                    pass
+
+            # ═══════════════════════════════════════
+            # TAB 2 — RUN COMMANDS
+            # ═══════════════════════════════════════
+            with gr.Tab("⚙️  Run Commands"):
+                gr.Markdown(
+                    "> **Safety note:** Commands run as your current user. "
+                    "Destructive patterns (`rm -rf /`, `mkfs`, etc.) are blocked.",
+                    elem_classes="gr-markdown",
+                )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.HTML('<p class="section-label">Common Commands</p>')
+                        common_cmds = [
+                            ("📋 List files",          "ls -lah"),
+                            ("💾 Disk usage (dir)",    "du -sh ./* | sort -hr | head -20"),
+                            ("🔎 Disk free",           "df -h"),
+                            ("⚙️  Running processes",  "ps aux --sort=-%cpu | head -20"),
+                            ("🌐 Network interfaces",  "ip a"),
+                            ("🔗 Open ports",          "ss -tulnp"),
+                            ("📜 Recent errors (log)", "journalctl -p err -n 30 --no-pager"),
+                            ("🔑 Who is logged in",    "w"),
+                            ("📦 Last installs (apt)", "grep ' install ' /var/log/dpkg.log 2>/dev/null | tail -20 || echo 'Not a Debian/Ubuntu system'"),
+                            ("🧩 Kernel version",      "uname -r"),
+                        ]
+                        for label, cmd_text in common_cmds:
+                            b = gr.Button(label, variant="secondary", size="sm")
+                            b.click(fn=lambda c=cmd_text: c, outputs=gr.Textbox(visible=False))
+
+                    with gr.Column(scale=3):
+                        cmd_input = gr.Textbox(
+                            label="Command",
+                            placeholder="e.g.   ls -lah   or   ps aux | grep python",
+                            lines=2,
+                        )
+                        with gr.Row():
+                            run_btn  = gr.Button("▶ Execute", variant="primary")
+                            copy_btn = gr.Button("Explain with AI →", variant="secondary")
+
+                        cmd_output = gr.Markdown(
+                            label="Output",
+                            elem_id="cmd-output",
                         )
 
-                # ── Timer: refresh packet table every 1s ──
-                pkt_timer = gr.Timer(value=1.0)
-                pkt_timer.tick(get_packet_table, outputs=pkt_table)
+                        run_btn.click(fn=run_command, inputs=cmd_input, outputs=cmd_output)
+                        cmd_input.submit(fn=run_command, inputs=cmd_input, outputs=cmd_output)
 
-                start_btn.click(
-                    start_capture,
-                    inputs=[iface_dd, bpf_input, save_pcap],
-                    outputs=capture_status,
-                )
-                stop_btn.click(stop_capture, outputs=capture_status)
+                # Wire common command buttons to cmd_input
+                for label, cmd_text in common_cmds:
+                    pass  # handled below via a proper pattern
 
-            # ════════════════════════════════
-            # TAB 2 — STATS
-            # ════════════════════════════════
-            with gr.Tab("📊  STATS"):
-                gr.HTML('<div class="pnl-hdr">Live Statistics</div>')
-                stats_md = gr.Markdown("_Start a capture to see statistics._")
-                stats_timer = gr.Timer(value=2.0)
-                stats_timer.tick(get_stats_md, outputs=stats_md)
-
-            # ════════════════════════════════
-            # TAB 3 — ALERTS
-            # ════════════════════════════════
-            with gr.Tab("🚨  ALERTS"):
-                gr.HTML('<div class="pnl-hdr">Security Alerts</div>')
-                alerts_md = gr.Markdown("_No alerts yet._", elem_classes="alert-box")
-                alerts_timer = gr.Timer(value=2.0)
-                alerts_timer.tick(get_alerts_md, outputs=alerts_md)
-
-            # ════════════════════════════════
-            # TAB 4 — AI ANALYSIS
-            # ════════════════════════════════
-            with gr.Tab("🤖  AI ANALYSIS"):
-                gr.HTML('<div class="pnl-hdr">Claude Sonnet — Traffic Analysis</div>')
-                gr.Markdown(
-                    "_Capture some traffic, then click **Analyse** to get an AI security report._"
-                )
-                analyse_btn = gr.Button("🤖 Analyse Traffic", variant="primary")
-                ai_output = gr.Textbox(
-                    label="AI Report",
-                    lines=18,
-                    interactive=False,
-                    elem_id="ai-out",
-                )
-                analyse_btn.click(ai_analyze, outputs=ai_output)
-
-            # ════════════════════════════════
-            # TAB 5 — TSHARK SHELL
-            # ════════════════════════════════
-            with gr.Tab("⚙  TSHARK SHELL"):
-                gr.HTML('<div class="pnl-hdr">Post-Capture TShark Commands</div>')
-                gr.Markdown(
-                    f"Run `tshark` commands against the saved capture `{PCAP_PATH}`.  \n"
-                    "_`-r <file>` is injected automatically if omitted._"
-                )
-
-                for label, cmd_template in [
-                    ("📋 Protocol hierarchy",
-                     f"tshark -r {PCAP_PATH} -q -z io,phs"),
-                    ("🏆 Top talkers (conv)",
-                     f"tshark -r {PCAP_PATH} -q -z conv,ip"),
-                    ("🌐 HTTP requests",
-                     f"tshark -r {PCAP_PATH} -Y http.request -T fields -e http.host -e http.request.uri"),
-                    ("🔎 DNS queries",
-                     f"tshark -r {PCAP_PATH} -Y dns.flags.response==0 -T fields -e dns.qry.name"),
-                    ("⚡ TCP SYN packets",
-                     f"tshark -r {PCAP_PATH} -Y 'tcp.flags.syn==1 && tcp.flags.ack==0'"),
-                    ("📦 Packet sizes",
-                     f"tshark -r {PCAP_PATH} -T fields -e frame.len | sort -n | uniq -c | sort -rn | head -20"),
-                ]:
-                    b = gr.Button(label, variant="secondary", size="sm")
-                    b.click(lambda c=cmd_template: c, outputs=None)  # wired below
-
+            # ═══════════════════════════════════════
+            # TAB 3 — SYSTEM STATS
+            # ═══════════════════════════════════════
+            with gr.Tab("📊  System Stats"):
                 with gr.Row():
-                    shell_input = gr.Textbox(
-                        placeholder=f"tshark -r {PCAP_PATH} -q -z io,phs",
-                        label="Command",
-                        scale=4,
-                    )
-                    shell_btn = gr.Button("▶ Run", variant="primary", scale=1)
+                    refresh_btn = gr.Button("⟳ Refresh", variant="secondary", size="sm")
 
-                shell_output = gr.Textbox(
-                    label="Output",
-                    lines=16,
-                    interactive=False,
-                    elem_id="ai-out",
+                stats_md = gr.Markdown(
+                    value=get_system_stats(),
+                    elem_classes="gr-markdown",
                 )
-                shell_btn.click(run_tshark_cmd, inputs=shell_input, outputs=shell_output)
-                shell_input.submit(run_tshark_cmd, inputs=shell_input, outputs=shell_output)
 
-                # Wire quick-command buttons properly
-                for label, cmd_template in [
-                    ("📋 Protocol hierarchy",
-                     f"tshark -r {PCAP_PATH} -q -z io,phs"),
-                    ("🏆 Top talkers (conv)",
-                     f"tshark -r {PCAP_PATH} -q -z conv,ip"),
-                    ("🌐 HTTP requests",
-                     f"tshark -r {PCAP_PATH} -Y http.request -T fields -e http.host -e http.request.uri"),
-                    ("🔎 DNS queries",
-                     f"tshark -r {PCAP_PATH} -Y dns.flags.response==0 -T fields -e dns.qry.name"),
-                    ("⚡ TCP SYN packets",
-                     f"tshark -r {PCAP_PATH} -Y 'tcp.flags.syn==1 && tcp.flags.ack==0'"),
-                    ("📦 Packet sizes",
-                     f"tshark -r {PCAP_PATH} -T fields -e frame.len | sort -n | uniq -c | sort -rn | head -20"),
-                ]:
-                    pass  # buttons above already lambda-bound to shell_input via outputs=shell_input
+                refresh_btn.click(fn=refresh_stats, outputs=stats_md)
 
-            # ════════════════════════════════
-            # TAB 6 — PIPELINE DOCS
-            # ════════════════════════════════
-            with gr.Tab("📖  PIPELINE"):
-                gr.Markdown("""
-## NetSniff Pipeline Architecture
-
-```
-Network Interface
-      │
-      ▼
-┌─────────────────────────────────────────────────────────┐
-│  tshark  -i <iface>  -T fields  -E separator=\\t  -l    │
-│          -e frame.number  -e frame.time_relative        │
-│          -e frame.len     -e ip.src / ip.dst            │
-│          -e _ws.col.Protocol                            │
-│          -e tcp.srcport   -e tcp.dstport                │
-│          -e dns.qry.name  -e http.host  -e tls.*        │
-│          [-f "BPF filter"]   [-w capture.pcap -P]       │
-└───────────────────────┬─────────────────────────────────┘
-                        │  stdout (line-buffered)
-                        ▼
-┌─────────────────────────────────────────────────────────┐
-│  Python capture thread (daemon)                         │
-│  • parse_tshark_line() → dict                           │
-│  • update_stats()  — Counter / deque                    │
-│  • heuristic alerts (port scan, SYN-only, XMAS, NULL)  │
-│  • packet_queue.put_nowait()   (maxsize=5000)           │
-└───────────────────────┬─────────────────────────────────┘
-                        │  queue.Queue (thread-safe)
-                        ▼
-┌─────────────────────────────────────────────────────────┐
-│  Gradio Timers (1s / 2s polling)                        │
-│  • drain_queue_to_log()                                 │
-│  • get_packet_table()  → Dataframe (live feed)         │
-│  • get_stats_md()      → Markdown (counters)           │
-│  • get_alerts_md()     → Markdown (alert table)        │
-└───────────────────────┬─────────────────────────────────┘
-                        │
-            ┌───────────┴──────────┐
-            ▼                      ▼
-  AI Analysis tab           TShark Shell tab
-  Claude Sonnet via          tshark -r pcap
-  Anthropic streaming API    post-capture queries
-```
-
-### Detected Threats
-| Pattern | Detection |
-|---|---|
-| Port scan | destination port in suspicious list |
-| SYN scan | TCP flags == 0x002 (SYN only) |
-| XMAS scan | FIN+PSH+URG (0x029) |
-| NULL scan | TCP flags == 0x000 |
-| RST flood | high RST flag rate |
-
-### BPF Filter Examples
-```bash
-tcp port 80 or tcp port 443          # web traffic
-udp port 53                           # DNS only
-not src net 192.168.0.0/16            # inbound only
-host 8.8.8.8                          # single host
-tcp[tcpflags] & tcp-syn != 0          # SYN packets
-portrange 1-1024                      # well-known ports
-```
-
-### Post-Capture TShark Commands
-```bash
-# Protocol stats
-tshark -r cap.pcap -q -z io,phs
-
-# Conversations
-tshark -r cap.pcap -q -z conv,tcp
-
-# Follow TCP stream
-tshark -r cap.pcap -q -z follow,tcp,ascii,0
-
-# Extract HTTP objects
-tshark -r cap.pcap --export-objects http,/tmp/objects
-
-# Convert to JSON
-tshark -r cap.pcap -T json > cap.json
-```
-""")
+                # Auto-refresh every 5s
+                stats_timer = gr.Timer(value=5.0)
+                stats_timer.tick(fn=refresh_stats, outputs=stats_md)
 
         # Footer
         gr.HTML("""
-        <div id="statusbar">
-          <span>NETSNIFF v1.0</span>
-          <span>·</span>
-          <span>TSHARK PIPELINE</span>
-          <span>·</span>
-          <span>CLAUDE SONNET</span>
-          <span style="margin-left:auto">⚠ RUN AS ROOT FOR FULL CAPTURE ACCESS</span>
+        <div id="footer">
+          LinuxGPT &nbsp;·&nbsp; Ollama backend &nbsp;·&nbsp; Commands execute on this machine
+        </div>
+        """)
+
+    return demo
+
+
+# ─────────────────────────────────────────────────────────
+# Rebuild with proper button wiring (Gradio needs
+# component references to be in scope at .click() time)
+# ─────────────────────────────────────────────────────────
+
+def build_ui_v2():
+    ok, status_msg = check_ollama()
+    models = list_ollama_models()
+    status_class = "ok" if ok else "err"
+    status_icon  = "● " if ok else "✕ "
+
+    with gr.Blocks(css=CSS, title="LinuxGPT", theme=gr.themes.Base()) as demo:
+
+        # ── Header ──
+        gr.HTML(f"""
+        <div id="app-header">
+          <div class="logo">&gt;_</div>
+          <div>
+            <h1>LinuxGPT</h1>
+            <div class="sub">AI-powered Linux assistant · Ollama backend</div>
+          </div>
+          <div id="status-pill" class="{status_class}">{status_icon}{status_msg}</div>
+        </div>
+        """)
+
+        with gr.Tabs():
+
+            # ═══════════════════════════════════════
+            # TAB 1 — CHAT
+            # ═══════════════════════════════════════
+            with gr.Tab("💬  Chat"):
+                with gr.Row(equal_height=False):
+
+                    # ── Sidebar ──
+                    with gr.Column(scale=1, min_width=230):
+                        gr.HTML('<p class="section-label">Model</p>')
+                        model_dd = gr.Dropdown(
+                            choices=models,
+                            value=models[0] if models else DEFAULT_MODEL,
+                            label="",
+                            interactive=True,
+                        )
+
+                        gr.HTML('<p class="section-label" style="margin-top:20px">Quick Prompts</p>')
+                        qp_buttons = []
+                        for icon_label, _ in QUICK_PROMPTS:
+                            b = gr.Button(icon_label, variant="secondary", size="sm")
+                            qp_buttons.append(b)
+
+                        gr.HTML('<p class="section-label" style="margin-top:20px">Paste Terminal Output</p>')
+                        paste_box = gr.Textbox(
+                            placeholder="Paste error or command output here…\nClaude will include it as context.",
+                            label="",
+                            lines=6,
+                            max_lines=14,
+                        )
+                        clear_paste_btn = gr.Button("Clear paste", variant="secondary", size="sm")
+
+                    # ── Chat column ──
+                    with gr.Column(scale=3):
+                        chatbot = gr.Chatbot(
+                            label="",
+                            height=520,
+                            show_label=False,
+                            show_copy_button=True,
+                            bubble_full_width=False,
+                        )
+                        with gr.Row():
+                            user_input = gr.Textbox(
+                                placeholder="Ask anything Linux — commands, debugging, scripting…",
+                                label="",
+                                scale=5,
+                                show_label=False,
+                                container=False,
+                            )
+                            send_btn = gr.Button("Send ↑", variant="primary", scale=1)
+                        with gr.Row():
+                            clear_btn = gr.Button("Clear chat", variant="secondary", size="sm")
+
+                # Wire quick prompts to user_input
+                for btn, (_, prompt_text) in zip(qp_buttons, QUICK_PROMPTS):
+                    btn.click(fn=lambda p=prompt_text: p, outputs=user_input)
+
+                clear_paste_btn.click(fn=lambda: "", outputs=paste_box)
+
+                submit_args = dict(
+                    fn=chat,
+                    inputs=[user_input, chatbot, model_dd, paste_box],
+                    outputs=[chatbot, user_input],
+                )
+                send_btn.click(**submit_args)
+                user_input.submit(**submit_args)
+                clear_btn.click(fn=clear_chat, outputs=[chatbot, user_input, paste_box])
+
+            # ═══════════════════════════════════════
+            # TAB 2 — RUN COMMANDS
+            # ═══════════════════════════════════════
+            with gr.Tab("⚙️  Run Commands"):
+                gr.HTML("""
+                <div style="background:#1c1a14;border:1px solid #3d3720;border-radius:8px;
+                            padding:10px 16px;margin-bottom:16px;font-size:13px;color:#f5a623;">
+                  ⚠ Commands execute on this machine as your current user.
+                  Destructive patterns are blocked.
+                </div>
+                """)
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=1, min_width=200):
+                        gr.HTML('<p class="section-label">Common Commands</p>')
+                        common_cmds = [
+                            ("📋 List files (detail)",  "ls -lah"),
+                            ("💾 Dir sizes",            "du -sh ./* | sort -hr | head -20"),
+                            ("🔎 Disk free space",      "df -h"),
+                            ("⚙️  Top CPU processes",   "ps aux --sort=-%cpu | head -20"),
+                            ("🌐 Network interfaces",   "ip addr show"),
+                            ("🔗 Open ports",           "ss -tulnp"),
+                            ("📜 System errors",        "journalctl -p err -n 30 --no-pager"),
+                            ("👥 Logged in users",      "w"),
+                            ("🧩 Kernel version",       "uname -r"),
+                            ("📦 Systemd services",     "systemctl list-units --type=service --state=running"),
+                        ]
+                        cc_buttons = []
+                        for label, _ in common_cmds:
+                            b = gr.Button(label, variant="secondary", size="sm")
+                            cc_buttons.append(b)
+
+                    with gr.Column(scale=3):
+                        cmd_input = gr.Textbox(
+                            label="Command",
+                            placeholder="e.g.   ls -lah   or   cat /etc/os-release",
+                            lines=2,
+                        )
+                        with gr.Row():
+                            run_btn     = gr.Button("▶ Execute", variant="primary")
+                            explain_btn = gr.Button("🤖 Explain output with AI", variant="secondary")
+
+                        cmd_output_md = gr.Markdown(
+                            value="",
+                            label="Output",
+                            elem_id="cmd-output",
+                        )
+
+                # Wire common command buttons
+                for btn, (_, cmd_text) in zip(cc_buttons, common_cmds):
+                    btn.click(fn=lambda c=cmd_text: c, outputs=cmd_input)
+
+                run_btn.click(fn=run_command, inputs=cmd_input, outputs=cmd_output_md)
+                cmd_input.submit(fn=run_command, inputs=cmd_input, outputs=cmd_output_md)
+
+            # ═══════════════════════════════════════
+            # TAB 3 — SYSTEM STATS
+            # ═══════════════════════════════════════
+            with gr.Tab("📊  System Stats"):
+                with gr.Row():
+                    refresh_btn = gr.Button("⟳ Refresh", variant="secondary", size="sm")
+
+                stats_md = gr.Markdown(
+                    value=get_system_stats(),
+                    elem_classes="gr-markdown",
+                )
+
+                refresh_btn.click(fn=refresh_stats, outputs=stats_md)
+                stats_timer = gr.Timer(value=5.0)
+                stats_timer.tick(fn=refresh_stats, outputs=stats_md)
+
+        gr.HTML("""
+        <div id="footer">
+          LinuxGPT &nbsp;·&nbsp; Ollama backend &nbsp;·&nbsp;
+          Commands execute on this machine &nbsp;·&nbsp;
+          Runs at <code>http://localhost:7860</code>
         </div>
         """)
 
@@ -1054,24 +856,28 @@ tshark -r cap.pcap -T json > cap.json
 
 if __name__ == "__main__":
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("  NetSniff — TShark Network Sniffer Pipeline")
+    print("  LinuxGPT — AI Linux Assistant")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    ok, msg = check_tshark()
-    print(f"  TShark: {msg}")
+    ok, msg = check_ollama()
+    icon = "✓" if ok else "✕"
+    print(f"  Ollama  {icon}  {msg}")
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("  ⚠  ANTHROPIC_API_KEY not set — AI analysis will fail")
-
-    if os.geteuid() != 0:
-        print("  ⚠  Not running as root — some interfaces may be unavailable")
-        print("     Tip: sudo python network_sniffer.py")
+    if not ok:
+        print()
+        print("  To start Ollama:")
+        print("    ollama serve")
+        print("    ollama pull llama3   # or mistral, codellama, etc.")
 
     print()
-    demo = build_ui()
+    print("  Opening http://localhost:7860")
+    print()
+
+    demo = build_ui_v2()
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7861,
+        server_port=7860,
         share=False,
         show_api=False,
+        favicon_path=None,
     )
