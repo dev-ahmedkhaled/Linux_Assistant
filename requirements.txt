@@ -12,3 +12,9 @@ nltk
 datasets
 evaluate
 gradio
+
+polars
+seaborn
+datasets
+wordcloud
+matplotlib
