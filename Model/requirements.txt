@@ -1,0 +1,10 @@
+unsloth==2026.5.2
+unsloth_zoo==2026.5.1
+flash-linear-attention
+transformers>=5.0
+datasets
+trl
+torch==2.10.0
+accelerate
+bitsandbytes
+vllm
